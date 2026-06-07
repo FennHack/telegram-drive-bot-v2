@@ -1,0 +1,19 @@
+{
+  "name": "telegram-drive-bot-v2",
+  "version": "2.0.0",
+  "description": "Telegram bot Google Drive dengan fitur lengkap",
+  "main": "bot.js",
+  "scripts": {
+    "dev": "node -e \"require('dotenv').config(); const bot = require('./bot'); bot.launch().then(() => console.log('Bot running...')).catch(console.error);\""
+  },
+  "dependencies": {
+    "archiver": "^6.0.1",
+    "axios": "^1.6.0",
+    "googleapis": "^140.0.0",
+    "mongodb": "^6.3.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "dotenv": "^16.0.0"
+  }
+}
