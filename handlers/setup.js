@@ -139,7 +139,7 @@ async function startSetup(ctx) {
     '━━━━━━━━━━━━━━━━\n' +
     '<b>LANGKAH 1 — Buat Project Google</b>\n' +
     '1. Buka <a href="https://console.cloud.google.com">console.cloud.google.com</a>\n' +
-    '2. Klik dropdown project di atas → <b>New Project</b>\n' +
+    '2. Klik "select a project" di atas → <b>New Project</b>\n' +
     '3. Isi nama bebas (misal: <code>drive-bot</code>) → klik <b>Create</b>\n' +
     '4. Pastikan project baru sudah aktif (nama tampil di header)\n\n' +
     '<b>LANGKAH 2 — Aktifkan Google Drive API</b>\n' +
