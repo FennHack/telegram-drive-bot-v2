@@ -2,11 +2,10 @@ const { Markup } = require('telegraf');
 const { saveUser, getUser, deleteUser, getUserCredentials } = require('../lib/users');
 const { getStorageQuota, formatBytes } = require('../lib/drive');
 
-const setupState = {}; // { userId: { step, clientId, clientSecret } }
+const setupState = {};
 
 function registerSetup(bot) {
 
-  // ── /setup ─────────────────────────────────────────────────────────────────
   bot.command('setup', async (ctx) => {
     const user = await getUser(ctx.from.id);
     if (user && user.clientId) {
@@ -42,9 +41,7 @@ function registerSetup(bot) {
     await deleteUser(ctx.from.id);
     delete setupState[ctx.from.id];
     await ctx.answerCbQuery();
-    await ctx.editMessageText(
-      '✅ Logout berhasil. Ketik /setup untuk login ulang.'
-    );
+    await ctx.editMessageText('✅ Logout berhasil. Ketik /setup untuk login ulang.');
   });
 
   bot.action('cancel_setup', async (ctx) => {
@@ -53,7 +50,6 @@ function registerSetup(bot) {
     await ctx.editMessageText('❌ Setup dibatalkan.');
   });
 
-  // ── /myaccount ─────────────────────────────────────────────────────────────
   bot.command('myaccount', async (ctx) => {
     const creds = await getUserCredentials(ctx.from.id);
     if (!creds) return ctx.reply('❌ Belum setup. Ketik /setup');
@@ -134,19 +130,49 @@ function registerSetup(bot) {
 async function startSetup(ctx) {
   setupState[ctx.from.id] = { step: 'client_id' };
   await ctx.reply(
-    '🔐 Setup Google Drive Bot\n\n' +
+    '<b>🔐 Setup Google Drive Bot</b>\n\n' +
     'Saya akan memandu kamu menghubungkan akun Google Drive.\n\n' +
-    'Kamu butuh:\n' +
-    '1. Client ID\n' +
-    '2. Client Secret\n' +
-    '3. Refresh Token\n\n' +
-    'Belum punya? Ikuti panduan:\n' +
-    '1. Buka console.cloud.google.com\n' +
-    '2. Buat project → aktifkan Google Drive API\n' +
-    '3. Buat OAuth Client ID (Web App)\n' +
-    '4. Dapatkan Refresh Token via OAuth Playground\n\n' +
-    '📋 Kirimkan Client ID kamu sekarang:',
-    Markup.inlineKeyboard([[Markup.button.callback('❌ Batal', 'cancel_setup')]])
+    '<b>Yang kamu butuhkan:</b>\n' +
+    '• Client ID\n' +
+    '• Client Secret\n' +
+    '• Refresh Token\n\n' +
+    '━━━━━━━━━━━━━━━━\n' +
+    '<b>LANGKAH 1 — Buat Project Google</b>\n' +
+    '1. Buka <a href="https://console.cloud.google.com">console.cloud.google.com</a>\n' +
+    '2. Klik dropdown project di atas → <b>New Project</b>\n' +
+    '3. Isi nama bebas (misal: <code>drive-bot</code>) → klik <b>Create</b>\n' +
+    '4. Pastikan project baru sudah aktif (nama tampil di header)\n\n' +
+    '<b>LANGKAH 2 — Aktifkan Google Drive API</b>\n' +
+    '1. Buka <a href="https://console.cloud.google.com/apis/library">APIs &amp; Services → Library</a>\n' +
+    '2. Cari <code>Google Drive API</code> → klik hasilnya\n' +
+    '3. Klik tombol <b>Enable</b> — tunggu sampai halaman refresh\n\n' +
+    '<b>LANGKAH 3 — Buat OAuth Credentials</b>\n' +
+    '1. Buka <a href="https://console.cloud.google.com/apis/credentials">APIs &amp; Services → Credentials</a>\n' +
+    '2. Klik <b>+ Create Credentials</b> → <b>OAuth client ID</b>\n' +
+    '3. Jika diminta consent screen: pilih <b>External</b> → isi nama app → Save and Continue (skip tab opsional)\n' +
+    '4. Kembali buat credentials → Application type: <b>Web application</b>\n' +
+    '5. Di bagian <b>Authorized redirect URIs</b>, tambahkan:\n' +
+    '<code>https://developers.google.com/oauthplayground</code>\n' +
+    '6. Klik <b>Create</b> → copy <b>Client ID</b> &amp; <b>Client Secret</b> dari popup\n\n' +
+    '⚠️ <i>Simpan Client ID &amp; Client Secret — akan dipakai di langkah berikutnya.</i>\n\n' +
+    '<b>LANGKAH 4 — Dapatkan Refresh Token</b>\n' +
+    '1. Buka <a href="https://developers.google.com/oauthplayground">OAuth Playground</a>\n' +
+    '2. Klik ikon ⚙️ pojok kanan atas → centang <b>Use your own OAuth credentials</b>\n' +
+    '3. Isi Client ID &amp; Client Secret dari langkah 3 → tutup panel\n' +
+    '4. Di panel kiri, ketik atau cari scope:\n' +
+    '<code>https://www.googleapis.com/auth/drive</code>\n' +
+    '   Centang scope tersebut → klik <b>Authorize APIs</b>\n' +
+    '5. Login akun Google yang mau dihubungkan → klik <b>Allow</b>\n' +
+    '6. Klik <b>Exchange authorization code for tokens</b>\n' +
+    '7. Copy nilai <b>Refresh token</b> dari panel kanan\n\n' +
+    '⚠️ <i>Refresh token hanya muncul sekali. Copy sebelum refresh halaman!</i>\n\n' +
+    '━━━━━━━━━━━━━━━━\n' +
+    '✅ Sudah punya semua? Kirimkan <b>Client ID</b> kamu sekarang:\n' +
+    '<i>(format: xxx.apps.googleusercontent.com)</i>',
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Batal', 'cancel_setup')]]),
+    }
   );
 }
 
@@ -162,7 +188,7 @@ function handleSetupInput(ctx, pendingActions) {
       return true;
     }
     setupState[ctx.from.id] = { step: 'client_secret', clientId: text };
-    ctx.reply('✅ Client ID tersimpan!\n\n📋 Sekarang kirimkan Client Secret kamu:');
+    ctx.reply('✅ Client ID tersimpan!\n\n📋 Sekarang kirimkan <b>Client Secret</b> kamu:\n<i>(format: GOCSPX-...)</i>', { parse_mode: 'HTML' });
     return true;
   }
 
@@ -174,9 +200,10 @@ function handleSetupInput(ctx, pendingActions) {
     setupState[ctx.from.id] = { ...state, step: 'refresh_token', clientSecret: text };
     ctx.reply(
       '✅ Client Secret tersimpan!\n\n' +
-      '📋 Sekarang kirimkan Refresh Token kamu.\n\n' +
-      'Belum punya? Buka:\nhttps://developers.google.com/oauthplayground\n\n' +
-      'Gunakan Client ID & Secret tadi, pilih scope:\nhttps://www.googleapis.com/auth/drive'
+      '📋 Sekarang kirimkan <b>Refresh Token</b> kamu.\n\n' +
+      'Belum punya? Ikuti langkah 4 di panduan tadi.\n\n' +
+      '<i>(format: 1//...)</i>',
+      { parse_mode: 'HTML' }
     );
     return true;
   }
@@ -187,7 +214,6 @@ function handleSetupInput(ctx, pendingActions) {
       return true;
     }
 
-    // Simpan dan selesai
     const { clientId, clientSecret } = state;
     delete setupState[ctx.from.id];
 
@@ -199,23 +225,23 @@ function handleSetupInput(ctx, pendingActions) {
       username: ctx.from.username,
       autoOrganize: false,
     }).then(async () => {
-      // Test koneksi
       try {
         const { getStorageQuota, formatBytes } = require('../lib/drive');
         const quota = await getStorageQuota({ clientId, clientSecret, refreshToken: text });
         const used = parseInt(quota.usage || 0);
         const total = parseInt(quota.limit || 0);
         ctx.reply(
-          '✅ Setup berhasil! Google Drive terhubung!\n\n' +
+          '✅ <b>Setup berhasil! Google Drive terhubung!</b>\n\n' +
           `📦 Storage: ${formatBytes(used)} / ${formatBytes(total)}\n` +
           `✅ Sisa: ${formatBytes(total - used)}\n\n` +
           '🚀 Sekarang kamu bisa:\n' +
-          '• Kirim foto/video untuk upload\n' +
-          '• /drive - lihat file\n' +
-          '• /uploadurl - upload dari link\n' +
-          '• /storage - cek storage\n' +
-          '• /myaccount - pengaturan akun\n' +
-          '• /help - bantuan lengkap'
+          '• Kirim foto/video/file untuk upload\n' +
+          '• /drive — lihat file\n' +
+          '• /uploadurl — upload dari link\n' +
+          '• /storage — cek storage\n' +
+          '• /myaccount — pengaturan akun\n' +
+          '• /help — bantuan lengkap',
+          { parse_mode: 'HTML' }
         );
       } catch (e) {
         ctx.reply(
@@ -232,4 +258,4 @@ function handleSetupInput(ctx, pendingActions) {
   return false;
 }
 
-module.exports = { registerSetup, handleSetupInput };
+module.exports = { registerSetup, handleSetupInput, startSetup };
