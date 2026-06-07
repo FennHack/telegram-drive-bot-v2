@@ -33,6 +33,7 @@ function registerCommands(bot, pendingActions) {
       '/browse — Browse folder\n' +
       '/download — Download file/folder dari Drive\n' +
       '/uploadto — Upload ke folder Drive tertentu\n' +
+      '/setfolder — Set folder default upload\n' +
       '/cari — Cari file\n' +
       '/storage — Info penyimpanan\n' +
       '/riwayat — Riwayat upload\n' +
@@ -422,16 +423,9 @@ function registerCommands(bot, pendingActions) {
     return false;
   }
 
-  // ── Download folder → ZIP (batch, tanpa limit file) ───────────────────────
-  const BATCH_SIZE = 50; // file per ZIP part
-
+  // ── Download folder → kirim daftar link per pesan (tanpa ZIP) ────────────
   async function downloadFolder(ctx, creds, folderId) {
-    const archiver = require('archiver');
-    const fs = require('fs');
-    const path = require('path');
-    const os = require('os');
-    const axios = require('axios');
-    const { listFolderContents, downloadLink, formatBytes } = require('../lib/drive');
+    const { listFolderContents, shareLink, downloadLink, formatBytes } = require('../lib/drive');
 
     const statusMsg = await ctx.reply('🔍 Menganalisis isi folder...');
     try {
@@ -453,150 +447,45 @@ function registerCommands(bot, pendingActions) {
         return ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, '❌ Folder kosong.');
       }
 
-      // Hitung total batch
-      const totalBatches = Math.ceil(allFiles.length / BATCH_SIZE);
       const totalSize = allFiles.reduce((s, f) => s + parseInt(f.size || 0), 0);
 
       // Kirim preview foto (maks 3)
       const images = allFiles.filter(f => f.mimeType.startsWith('image/')).slice(0, 3);
-      if (images.length > 0) {
-        try {
-          await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-            `🖼 Preview foto dalam folder...`
-          );
-        } catch (_) {}
-        for (const img of images) {
-          try { await ctx.replyWithPhoto(downloadLink(img.id), { caption: `🖼 ${img.name}` }); } catch (_) {}
-        }
+      for (const img of images) {
+        try { await ctx.replyWithPhoto(downloadLink(img.id), { caption: `🖼 ${img.name}` }); } catch (_) {}
       }
 
-      // Kirim manifest (potong kalau terlalu panjang)
-      const manifestLines = allFiles.map((f, i) => {
-        const icon =
-          f.mimeType.startsWith('image/') ? '🖼' :
-          f.mimeType.startsWith('video/') ? '🎬' :
-          f.mimeType.startsWith('audio/') ? '🎵' :
-          f.mimeType === 'application/pdf' ? '📄' : '📁';
-        return `${i + 1}. ${icon} ${f.zipPath} (${formatBytes(f.size)})`;
-      });
+      // Kirim daftar link, dipecah per 20 file supaya tidak melebihi 4096 char
+      const CHUNK = 20;
+      const totalChunks = Math.ceil(allFiles.length / CHUNK);
 
-      // Telegram max 4096 char — potong manifest jika perlu
-      const header = `📂 Isi Folder — ${allFiles.length} file (${formatBytes(totalSize)})\n` +
-        (totalBatches > 1 ? `📦 Akan dikirim dalam ${totalBatches} ZIP part\n` : '') + '\n';
-      let manifestText = header;
-      for (const line of manifestLines) {
-        if ((manifestText + line + '\n').length > 4000) {
-          manifestText += `... dan ${allFiles.length - manifestLines.indexOf(line)} file lainnya`;
-          break;
+      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
+        `📂 Folder berisi ${allFiles.length} file (${formatBytes(totalSize)})\n` +
+        `🔗 Link download dikirim dalam ${totalChunks} pesan...`
+      );
+
+      for (let c = 0; c < totalChunks; c++) {
+        const chunk = allFiles.slice(c * CHUNK, (c + 1) * CHUNK);
+        let msg = `📂 File ${c * CHUNK + 1}–${c * CHUNK + chunk.length} dari ${allFiles.length}\n\n`;
+        for (const f of chunk) {
+          const icon =
+            f.mimeType.startsWith('image/') ? '🖼' :
+            f.mimeType.startsWith('video/') ? '🎬' :
+            f.mimeType.startsWith('audio/') ? '🎵' :
+            f.mimeType === 'application/pdf' ? '📄' : '📁';
+          msg += `${icon} ${f.zipPath}\n`;
+          msg += `📦 ${formatBytes(f.size)}\n`;
+          msg += `🔗 ${shareLink(f.id)}\n\n`;
         }
-        manifestText += line + '\n';
-      }
-      await ctx.reply(manifestText);
-
-      // Proses per batch
-      for (let batch = 0; batch < totalBatches; batch++) {
-        const batchFiles = allFiles.slice(batch * BATCH_SIZE, (batch + 1) * BATCH_SIZE);
-        const partLabel = totalBatches > 1 ? ` (Part ${batch + 1}/${totalBatches})` : '';
-
-        try {
-          await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-            `📦 Memproses ZIP${partLabel}...\n\n[░░░░░░░░░░░░░░░░░░░░] 0%\n\n` +
-            `📁 ${batchFiles.length} file dalam batch ini`
-          );
-        } catch (_) {}
-
-        const zipPath = path.join(os.tmpdir(), `drivezip_${Date.now()}_part${batch + 1}.zip`);
-        const output = fs.createWriteStream(zipPath);
-        const archive = archiver('zip', { zlib: { level: 6 } });
-        archive.pipe(output);
-
-        const tmpFiles = [];
-        let failed = 0;
-
-        for (let i = 0; i < batchFiles.length; i++) {
-          const f = batchFiles[i];
-          const globalIdx = batch * BATCH_SIZE + i + 1;
-          const pct = Math.round((i / batchFiles.length) * 100);
-          const filled = Math.round(pct / 5);
-          const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
-
-          try {
-            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-              `📦 Mengemas${partLabel}...\n[${bar}] ${pct}%\n\n` +
-              `📄 ${globalIdx}/${allFiles.length}: ${f.name}`
-            );
-          } catch (_) {}
-
-          const tmpFile = path.join(os.tmpdir(), `zipitem_${Date.now()}_${i}`);
-          try {
-            const response = await axios({
-              url: downloadLink(f.id),
-              method: 'GET',
-              responseType: 'stream',
-              timeout: 120000,
-            });
-            await new Promise((resolve, reject) => {
-              const writer = fs.createWriteStream(tmpFile);
-              response.data.pipe(writer);
-              writer.on('finish', resolve);
-              writer.on('error', reject);
-            });
-            archive.file(tmpFile, { name: f.zipPath });
-            tmpFiles.push(tmpFile);
-          } catch (_) {
-            failed++;
-          }
-        }
-
-        await new Promise((resolve, reject) => {
-          output.on('close', resolve);
-          archive.on('error', reject);
-          archive.finalize();
-        });
-
-        const zipSize = fs.statSync(zipPath).size;
-
-        // Cek ukuran ZIP — Telegram max 50MB untuk bot
-        if (zipSize > 49 * 1024 * 1024) {
-          await ctx.reply(
-            `⚠️ ZIP Part ${batch + 1} terlalu besar (${formatBytes(zipSize)}) untuk dikirim via Telegram.\n\n` +
-            `Batas Telegram: 50MB per file.\n` +
-            `Gunakan /browse untuk download subfolder yang lebih kecil.`
-          );
-        } else {
-          try {
-            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-              `📤 Mengirim ZIP${partLabel} (${formatBytes(zipSize)})...`
-            );
-          } catch (_) {}
-
-          const filename = totalBatches > 1
-            ? `drive_part${batch + 1}of${totalBatches}_${Date.now()}.zip`
-            : `drive_folder_${Date.now()}.zip`;
-
-          await ctx.replyWithDocument(
-            { source: zipPath, filename },
-            { caption: `📦 Part ${batch + 1}/${totalBatches} — ${batchFiles.length} file — ${formatBytes(zipSize)}${failed > 0 ? `\n⚠️ ${failed} file gagal diunduh` : ''}` }
-          );
-        }
-
-        // Cleanup batch ini
-        try { fs.unlinkSync(zipPath); } catch (_) {}
-        tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch (_) {} });
+        await ctx.reply(msg);
       }
 
-      try {
-        await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id);
-      } catch (_) {}
-
-      if (totalBatches > 1) {
-        await ctx.reply(`✅ Selesai! Total ${totalBatches} ZIP terkirim untuk ${allFiles.length} file.`);
-      }
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch (_) {}
 
     } catch (err) {
       console.error(err);
       try {
-        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, '❌ Gagal download folder: ' + err.message);
+        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, '❌ Gagal: ' + err.message);
       } catch (_) {}
     }
   }
@@ -854,7 +743,132 @@ function registerCommands(bot, pendingActions) {
   // Callback noop
   bot.action('noop', async (ctx) => { await ctx.answerCbQuery(); });
 
-  // Expose handleDownloadLink & handleUploadToLink untuk text handler di bot.js
+  // ── /setfolder ─────────────────────────────────────────────────────────────
+  // Set folder default untuk semua upload berikutnya
+  bot.command('setfolder', async (ctx) => {
+    const creds = await getUserCredentials(ctx.from.id);
+    if (!creds) return ctx.reply('❌ Belum setup. Ketik /setup');
+
+    const input = ctx.message.text.replace('/setfolder', '').trim();
+
+    // Tanpa argumen → tampilkan folder picker dari root Drive
+    if (!input) {
+      try {
+        const folders = await listFolders(creds);
+
+        // Kalau ada folder default sekarang, tampilkan dulu
+        let currentMsg = '';
+        if (creds.defaultFolderId) {
+          try {
+            const { getFileInfo } = require('../lib/drive');
+            const info = await getFileInfo(creds, creds.defaultFolderId);
+            currentMsg = `📂 Folder default sekarang: ${info.name}\n\n`;
+          } catch (_) {}
+        }
+
+        if (folders.length === 0) {
+          return ctx.reply(
+            currentMsg + '📂 Belum ada folder di Drive.\n\nBuat dulu dengan /newfolder, atau kirim link folder:\n/setfolder https://drive.google.com/drive/folders/ID',
+            Markup.inlineKeyboard([[Markup.button.callback('❌ Hapus Folder Default', 'setfolder_clear')]])
+          );
+        }
+
+        const buttons = folders.slice(0, 20).map(f => [
+          Markup.button.callback(`📁 ${f.name.substring(0, 35)}`, `sf_${f.id}`)
+        ]);
+        if (creds.defaultFolderId) {
+          buttons.push([Markup.button.callback('❌ Hapus Folder Default (upload ke root)', 'setfolder_clear')]);
+        }
+        buttons.push([Markup.button.callback('❌ Batal', 'cancel')]);
+
+        await ctx.reply(
+          currentMsg + '📁 Pilih folder default untuk semua upload:',
+          Markup.inlineKeyboard(buttons)
+        );
+      } catch (e) {
+        ctx.reply('❌ Gagal: ' + e.message);
+      }
+      return;
+    }
+
+    // Dengan argumen link → parse dan set langsung
+    const parsed = parseDriveLink(input);
+    if (!parsed || parsed.type !== 'folder') {
+      return ctx.reply('❌ Link tidak valid. Format:\nhttps://drive.google.com/drive/folders/FOLDER_ID');
+    }
+    await applySetFolder(ctx, creds, parsed.id);
+  });
+
+  // Callback: pilih folder dari list
+  bot.action(/^sf_(.+)$/, async (ctx) => {
+    const folderId = ctx.match[1];
+    const creds = await getUserCredentials(ctx.from.id);
+    await ctx.answerCbQuery();
+    await applySetFolder(ctx, creds, folderId, true);
+  });
+
+  // Callback: hapus folder default
+  bot.action('setfolder_clear', async (ctx) => {
+    await ctx.answerCbQuery();
+    const { saveUser } = require('../lib/users');
+    await saveUser(ctx.from.id, { defaultFolderId: null });
+    await ctx.editMessageText('✅ Folder default dihapus. Upload berikutnya masuk ke root Drive.');
+  });
+
+  async function applySetFolder(ctx, creds, folderId, isCallback = false) {
+    try {
+      const { getFileInfo } = require('../lib/drive');
+      const { saveUser } = require('../lib/users');
+      const info = await getFileInfo(creds, folderId);
+      await saveUser(ctx.from.id, { defaultFolderId: folderId });
+
+      const msg =
+        '✅ Folder default berhasil diset!\n\n' +
+        `📁 Nama: ${info.name}\n` +
+        `🔗 Link: ${folderLink(folderId)}\n\n` +
+        'Semua upload berikutnya otomatis masuk ke folder ini.\nGunakan /setfolder untuk mengubah.';
+
+      const markup = Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Hapus Folder Default', 'setfolder_clear')],
+      ]);
+
+      if (isCallback) {
+        await ctx.editMessageText(msg, markup);
+      } else {
+        await ctx.reply(msg, markup);
+      }
+    } catch (e) {
+      const errMsg = '❌ Gagal set folder: ' + e.message;
+      isCallback ? ctx.editMessageText(errMsg) : ctx.reply(errMsg);
+    }
+  }
+
+  // ── Register command list (muncul saat user ketik / di chat) ───────────────
+  async function registerBotCommands() {
+    await bot.telegram.setMyCommands([
+      { command: 'start',      description: '👋 Mulai bot' },
+      { command: 'drive',      description: '📂 Lihat file terbaru di Drive' },
+      { command: 'cari',       description: '🔍 Cari file — /cari nama_file' },
+      { command: 'browse',     description: '📁 Browse folder Drive' },
+      { command: 'storage',    description: '📊 Info penyimpanan Drive' },
+      { command: 'uploadto',   description: '📤 Upload ke folder Drive tertentu' },
+      { command: 'setfolder',  description: '📁 Set folder default upload' },
+      { command: 'download',   description: '📥 Download file/folder dari Drive' },
+      { command: 'newfolder',  description: '🗂️ Buat folder baru' },
+      { command: 'uploadurl',  description: '🌐 Upload file dari URL' },
+      { command: 'bintang',    description: '⭐ File berbintang' },
+      { command: 'riwayat',    description: '📋 Riwayat upload' },
+      { command: 'statistik',  description: '📊 Statistik upload' },
+      { command: 'myaccount',  description: '👤 Info akun' },
+      { command: 'logout',     description: '🚪 Logout & hapus credentials' },
+      { command: 'help',       description: '📖 Bantuan lengkap' },
+    ]);
+  }
+
+  // Jalankan sekali saat bot start
+  registerBotCommands().catch(console.error);
+
+  // Expose
   return { handleDownloadLink, handleUploadToLink };
 }
 
