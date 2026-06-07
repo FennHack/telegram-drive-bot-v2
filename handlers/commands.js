@@ -738,21 +738,45 @@ function registerCommands(bot, pendingActions) {
     await showFolderPicker(ctx, creds, parsed.id, null, false);
   }
 
+  // ── Folder picker session ──────────────────────────────────────────────────
+  // Simpan mapping key pendek → Drive folder ID, per user
+  // { userId: { counter: 0, map: { 'a1': folderId, ... }, stack: [folderId,...] } }
+  const folderPickerSession = {};
+
+  function fpKey(userId, folderId) {
+    const sess = folderPickerSession[userId];
+    // Cari key yang sudah ada
+    for (const [k, v] of Object.entries(sess.map)) {
+      if (v === folderId) return k;
+    }
+    // Buat key baru (2 char base36, cukup untuk ratusan folder)
+    const key = (sess.counter++).toString(36).padStart(2, '0');
+    sess.map[key] = folderId;
+    return key;
+  }
+
+  function fpId(userId, key) {
+    return folderPickerSession[userId]?.map[key] || null;
+  }
+
   /**
    * Tampilkan picker folder untuk memilih tujuan upload.
-   * @param {object} ctx
-   * @param {object} creds
-   * @param {string} folderId   - folder yang sedang ditampilkan
-   * @param {string|null} parentId - parent folder untuk tombol Back (null = root link)
-   * @param {boolean} edit      - edit pesan existing atau kirim baru
+   * Callback data maksimal: "pf:xx:xx" = 8 byte, aman jauh di bawah 64 byte.
    */
   async function showFolderPicker(ctx, creds, folderId, parentId, edit) {
+    const userId = ctx.from.id;
+
+    // Init session kalau belum ada
+    if (!folderPickerSession[userId]) {
+      folderPickerSession[userId] = { counter: 0, map: {}, stack: [] };
+    }
+
     try {
       const items = await listFolderContents(creds, folderId);
       const subfolders = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder');
       const files = items.filter(i => i.mimeType !== 'application/vnd.google-apps.folder');
 
-      // Info folder saat ini
+      // Nama folder saat ini
       let folderName = 'Folder ini';
       try {
         const { getFileInfo } = require('../lib/drive');
@@ -765,27 +789,35 @@ function registerCommands(bot, pendingActions) {
       if (subfolders.length > 0) msg += ` • 📁 ${subfolders.length} subfolder`;
       msg += '\n\nPilih subfolder atau upload langsung ke sini:';
 
+      // Daftarkan folderId & parentId ke session → dapat key pendek
+      const curKey = fpKey(userId, folderId);
+      const parKey = parentId ? fpKey(userId, parentId) : null;
+
       const buttons = [];
 
-      // Tombol upload ke folder ini (selalu tampil di atas)
+      // Tombol upload ke folder ini
+      // uploadhere_ sudah ada handler-nya di fileactions, pakai Drive ID langsung
+      // tapi uploadhere_ + Drive ID (33 char) = ~43 byte → masih aman
       buttons.push([
-        Markup.button.callback(`📤 Upload ke "${folderName.substring(0, 20)}"`, `uploadhere_${folderId}`)
+        Markup.button.callback(`📤 Upload ke "${folderName.substring(0, 18)}"`, `uploadhere_${folderId}`)
       ]);
 
-      // Subfolder (maks 20 tombol supaya tidak overflow)
+      // Subfolder (maks 20)
       for (const sf of subfolders.slice(0, 20)) {
+        const sfKey = fpKey(userId, sf.id);
+        // callback: "pf:sfKey:curKey" — maks ~10 byte
         buttons.push([
-          Markup.button.callback(`📁 ${sf.name.substring(0, 30)}`, `pickfolder_${sf.id}_${folderId}`)
+          Markup.button.callback(`📁 ${sf.name.substring(0, 32)}`, `pf:${sfKey}:${curKey}`)
         ]);
       }
 
       if (subfolders.length > 20) {
-        buttons.push([Markup.button.callback(`... dan ${subfolders.length - 20} subfolder lagi`, 'noop')]);
+        buttons.push([Markup.button.callback(`… ${subfolders.length - 20} subfolder lagi tidak tampil`, 'noop')]);
       }
 
-      // Tombol back ke parent
-      if (parentId) {
-        buttons.push([Markup.button.callback('🔙 Kembali', `pickfolder_${parentId}_root`)]);
+      // Tombol back
+      if (parKey) {
+        buttons.push([Markup.button.callback('🔙 Kembali', `pf:${parKey}:back`)]);
       }
       buttons.push([Markup.button.callback('❌ Batal', 'cancel')]);
 
@@ -797,22 +829,29 @@ function registerCommands(bot, pendingActions) {
       }
     } catch (e) {
       const errMsg = '❌ Gagal membuka folder: ' + e.message;
-      edit ? ctx.editMessageText(errMsg) : ctx.reply(errMsg);
+      try { edit ? await ctx.editMessageText(errMsg) : await ctx.reply(errMsg); } catch (_) { await ctx.reply(errMsg); }
     }
   }
 
-  // Callback: navigasi folder di picker
-  // format: pickfolder_{folderId}_{parentId}
-  bot.action(/^pickfolder_([^_]+)_(.+)$/, async (ctx) => {
+  // Callback navigasi folder picker
+  // format: "pf:{folderKey}:{parentKey|back}"
+  bot.action(/^pf:([a-z0-9]+):([a-z0-9]+|back)$/, async (ctx) => {
     await ctx.answerCbQuery();
-    const folderId = ctx.match[1];
-    const parentId = ctx.match[2] === 'root' ? null : ctx.match[2];
-    const creds = await getUserCredentials(ctx.from.id);
+    const userId = ctx.from.id;
+    const folderKey = ctx.match[1];
+    const parentKey = ctx.match[2];
+
+    const folderId = fpId(userId, folderKey);
+    const parentId = parentKey === 'back' ? null : fpId(userId, parentKey);
+
+    if (!folderId) return ctx.reply('⚠️ Session habis. Kirim ulang /uploadto');
+
+    const creds = await getUserCredentials(userId);
     if (!creds) return ctx.reply('❌ Belum setup.');
     await showFolderPicker(ctx, creds, folderId, parentId, true);
   });
 
-  // Callback noop (untuk label informatif)
+  // Callback noop
   bot.action('noop', async (ctx) => { await ctx.answerCbQuery(); });
 
   // Expose handleDownloadLink & handleUploadToLink untuk text handler di bot.js
