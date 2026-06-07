@@ -13,7 +13,7 @@ const pendingActions = {};
 
 // ── Register handlers ──────────────────────────────────────────────────────────
 registerSetup(bot);
-const { handleDownloadLink } = registerCommands(bot, pendingActions);
+const { handleDownloadLink, handleUploadToLink } = registerCommands(bot, pendingActions);
 registerFileActions(bot, pendingActions);
 
 // ── Media upload handlers ──────────────────────────────────────────────────────
@@ -66,6 +66,12 @@ bot.on('text', async (ctx) => {
   if (pending.action === 'download_prompt') {
     delete pendingActions[ctx.from.id];
     return handleDownloadLink(ctx, text);
+  }
+
+  // ── Upload to folder prompt ──────────────────────────────────────────────
+  if (pending.action === 'uploadto_prompt') {
+    delete pendingActions[ctx.from.id];
+    return handleUploadToLink(ctx, text);
   }
 
   // Cek setup sebelum handle pending actions lainnya
