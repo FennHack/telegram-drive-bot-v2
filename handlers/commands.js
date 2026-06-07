@@ -6,8 +6,6 @@ const {
 } = require('../lib/drive');
 const { getUserCredentials, getUploadHistory, getUploadStats } = require('../lib/users');
 
-// ── Session pagination (in-memory, cukup untuk single instance) ────────────────
-// key: `${userId}_page` → { options, history: [token,...] }
 const pageSession = {};
 
 function registerCommands(bot, pendingActions) {
@@ -44,14 +42,11 @@ function registerCommands(bot, pendingActions) {
     );
   });
 
+  // ── start_setup callback — delegate ke startSetup() dari setup.js ──────────
   bot.action('start_setup', async (ctx) => {
     await ctx.answerCbQuery();
-    ctx.reply(
-      '🔐 Setup Google Drive Bot\n\n' +
-      'Saya akan memandu kamu.\n\n' +
-      'Pertama, kirimkan Client ID Google OAuth2 kamu\n' +
-      '(format: xxx.apps.googleusercontent.com):'
-    );
+    const { startSetup } = require('./setup');
+    await startSetup(ctx);
   });
 
   // ── /help ──────────────────────────────────────────────────────────────────
@@ -121,18 +116,10 @@ function registerCommands(bot, pendingActions) {
 
   // ── /drive ─────────────────────────────────────────────────────────────────
   bot.command('drive', async (ctx) => {
-    // reset session
     pageSession[ctx.from.id] = { options: {}, tokenHistory: [null] };
     await showFileList(ctx, {}, 0, false);
   });
 
-  /**
-   * Render daftar file.
-   * @param {object} ctx
-   * @param {object} options  - filter options untuk listFiles
-   * @param {number} page     - indeks halaman saat ini (0-based)
-   * @param {boolean} editMsg - edit pesan existing atau kirim baru
-   */
   async function showFileList(ctx, options, page, editMsg) {
     const creds = await getUserCredentials(ctx.from.id);
     if (!creds) return ctx.reply('❌ Belum setup. Ketik /setup');
@@ -143,7 +130,6 @@ function registerCommands(bot, pendingActions) {
     try {
       const { files, nextPageToken } = await listFiles(creds, { pageSize: 8, ...options, pageToken });
 
-      // Simpan token halaman berikutnya
       if (nextPageToken && session.tokenHistory.length === page + 1) {
         session.tokenHistory.push(nextPageToken);
       }
@@ -166,7 +152,6 @@ function registerCommands(bot, pendingActions) {
         fileButtons.push([Markup.button.callback(`${icon} ${f.name.substring(0, 28)}`, `info_${f.id}`)]);
       });
 
-      // Navigasi — hanya pakai nomor halaman, bukan token langsung (aman untuk 64b limit)
       const navButtons = [];
       if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `drivepage_${page - 1}`));
       if (nextPageToken) navButtons.push(Markup.button.callback('➡️ Next', `drivepage_${page + 1}`));
@@ -193,7 +178,6 @@ function registerCommands(bot, pendingActions) {
     }
   }
 
-  // Navigasi halaman — ambil page index dari callback data
   bot.action(/^drivepage_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const page = parseInt(ctx.match[1]);
@@ -205,7 +189,6 @@ function registerCommands(bot, pendingActions) {
   bot.action('refresh_drive', async (ctx) => {
     await ctx.answerCbQuery('🔄 Refresh...');
     const session = pageSession[ctx.from.id] || { options: {}, tokenHistory: [null] };
-    // reset ke halaman 1
     const freshSession = { options: session.options, tokenHistory: [null] };
     pageSession[ctx.from.id] = freshSession;
     await showFileList(ctx, session.options, 0, true);
@@ -317,8 +300,6 @@ function registerCommands(bot, pendingActions) {
   });
 
   // ── /download ──────────────────────────────────────────────────────────────
-  // Usage: /download https://drive.google.com/drive/folders/FOLDER_ID
-  //        /download https://drive.google.com/file/d/FILE_ID/view
   bot.command('download', async (ctx) => {
     const input = ctx.message.text.replace('/download', '').trim();
     if (!input) {
@@ -335,20 +316,13 @@ function registerCommands(bot, pendingActions) {
     await handleDownloadLink(ctx, input);
   });
 
-  /**
-   * Parse Drive link → { type: 'file'|'folder', id }
-   */
   function parseDriveLink(input) {
-    // file: /file/d/ID
     let m = input.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
     if (m) return { type: 'file', id: m[1] };
-    // folder: /folders/ID
     m = input.match(/\/folders\/([a-zA-Z0-9_-]+)/);
     if (m) return { type: 'folder', id: m[1] };
-    // open?id=ID
     m = input.match(/[?&]id=([a-zA-Z0-9_-]+)/);
     if (m) return { type: 'file', id: m[1] };
-    // bare ID (hanya karakter valid Drive)
     if (/^[a-zA-Z0-9_-]{25,}$/.test(input)) return { type: 'file', id: input };
     return null;
   }
@@ -369,23 +343,17 @@ function registerCommands(bot, pendingActions) {
     }
   }
 
-  // Export supaya bisa dipanggil dari text handler
   bot.handleDownloadLink = handleDownloadLink;
 
-  // ── Download 1 file ────────────────────────────────────────────────────────
   async function downloadSingleFile(ctx, creds, fileId) {
     const statusMsg = await ctx.reply('🔍 Mengambil info file...');
     try {
       const { getFileInfo, isFilePublic, shareLink, downloadLink, formatBytes } = require('../lib/drive');
       const info = await getFileInfo(creds, fileId);
       const pub = await isFilePublic(creds, fileId);
-      const isImage = info.mimeType.startsWith('image/');
-      const isVideo = info.mimeType.startsWith('video/');
 
-      // Kirim preview dulu (foto/video)
-      const previewSent = await sendPreview(ctx, creds, info, fileId);
+      await sendPreview(ctx, creds, info, fileId);
 
-      // Edit status → info + tombol
       await ctx.telegram.editMessageText(
         ctx.chat.id, statusMsg.message_id, null,
         '📥 File siap didownload\n\n' +
@@ -405,17 +373,14 @@ function registerCommands(bot, pendingActions) {
     }
   }
 
-  // ── Preview foto/video ─────────────────────────────────────────────────────
   async function sendPreview(ctx, creds, info, fileId) {
     try {
       const { downloadLink } = require('../lib/drive');
       if (info.mimeType.startsWith('image/')) {
-        const url = downloadLink(fileId);
-        await ctx.replyWithPhoto(url, { caption: `🖼 ${info.name}` });
+        await ctx.replyWithPhoto(downloadLink(fileId), { caption: `🖼 ${info.name}` });
         return true;
       }
       if (info.mimeType.startsWith('video/')) {
-        // Video terlalu besar untuk dikirim langsung — kirim thumbnail placeholder
         await ctx.reply(`🎬 Preview: ${info.name}\n\n📦 Ukuran: ${require('../lib/drive').formatBytes(info.size)}\n\nFile video tidak di-preview langsung karena ukuran. Gunakan tombol di bawah untuk kirim ke chat.`);
         return true;
       }
@@ -423,13 +388,11 @@ function registerCommands(bot, pendingActions) {
     return false;
   }
 
-  // ── Download folder → kirim daftar link per pesan (tanpa ZIP) ────────────
   async function downloadFolder(ctx, creds, folderId) {
     const { listFolderContents, shareLink, downloadLink, formatBytes } = require('../lib/drive');
 
     const statusMsg = await ctx.reply('🔍 Menganalisis isi folder...');
     try {
-      // Rekursif kumpulkan semua file
       const allFiles = [];
       async function collectFiles(fid, prefix) {
         const items = await listFolderContents(creds, fid);
@@ -449,13 +412,11 @@ function registerCommands(bot, pendingActions) {
 
       const totalSize = allFiles.reduce((s, f) => s + parseInt(f.size || 0), 0);
 
-      // Kirim preview foto (maks 3)
       const images = allFiles.filter(f => f.mimeType.startsWith('image/')).slice(0, 3);
       for (const img of images) {
         try { await ctx.replyWithPhoto(downloadLink(img.id), { caption: `🖼 ${img.name}` }); } catch (_) {}
       }
 
-      // Kirim daftar link, dipecah per 20 file supaya tidak melebihi 4096 char
       const CHUNK = 20;
       const totalChunks = Math.ceil(allFiles.length / CHUNK);
 
@@ -490,7 +451,6 @@ function registerCommands(bot, pendingActions) {
     }
   }
 
-  // ── Callback: kirim file ke chat ───────────────────────────────────────────
   bot.action(/^sendfile_(.+)$/, async (ctx) => {
     const fileId = ctx.match[1];
     const creds = await getUserCredentials(ctx.from.id);
@@ -598,8 +558,6 @@ function registerCommands(bot, pendingActions) {
   });
 
   // ── /uploadto ──────────────────────────────────────────────────────────────
-  // Usage: /uploadto https://drive.google.com/drive/folders/FOLDER_ID
-  // Atau /uploadto tanpa argumen → minta link
   bot.command('uploadto', async (ctx) => {
     const input = ctx.message.text.replace('/uploadto', '').trim();
     if (!input) {
@@ -627,18 +585,13 @@ function registerCommands(bot, pendingActions) {
     await showFolderPicker(ctx, creds, parsed.id, null, false);
   }
 
-  // ── Folder picker session ──────────────────────────────────────────────────
-  // Simpan mapping key pendek → Drive folder ID, per user
-  // { userId: { counter: 0, map: { 'a1': folderId, ... }, stack: [folderId,...] } }
   const folderPickerSession = {};
 
   function fpKey(userId, folderId) {
     const sess = folderPickerSession[userId];
-    // Cari key yang sudah ada
     for (const [k, v] of Object.entries(sess.map)) {
       if (v === folderId) return k;
     }
-    // Buat key baru (2 char base36, cukup untuk ratusan folder)
     const key = (sess.counter++).toString(36).padStart(2, '0');
     sess.map[key] = folderId;
     return key;
@@ -648,14 +601,9 @@ function registerCommands(bot, pendingActions) {
     return folderPickerSession[userId]?.map[key] || null;
   }
 
-  /**
-   * Tampilkan picker folder untuk memilih tujuan upload.
-   * Callback data maksimal: "pf:xx:xx" = 8 byte, aman jauh di bawah 64 byte.
-   */
   async function showFolderPicker(ctx, creds, folderId, parentId, edit) {
     const userId = ctx.from.id;
 
-    // Init session kalau belum ada
     if (!folderPickerSession[userId]) {
       folderPickerSession[userId] = { counter: 0, map: {}, stack: [] };
     }
@@ -665,7 +613,6 @@ function registerCommands(bot, pendingActions) {
       const subfolders = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder');
       const files = items.filter(i => i.mimeType !== 'application/vnd.google-apps.folder');
 
-      // Nama folder saat ini
       let folderName = 'Folder ini';
       try {
         const { getFileInfo } = require('../lib/drive');
@@ -678,23 +625,17 @@ function registerCommands(bot, pendingActions) {
       if (subfolders.length > 0) msg += ` • 📁 ${subfolders.length} subfolder`;
       msg += '\n\nPilih subfolder atau upload langsung ke sini:';
 
-      // Daftarkan folderId & parentId ke session → dapat key pendek
       const curKey = fpKey(userId, folderId);
       const parKey = parentId ? fpKey(userId, parentId) : null;
 
       const buttons = [];
 
-      // Tombol upload ke folder ini
-      // uploadhere_ sudah ada handler-nya di fileactions, pakai Drive ID langsung
-      // tapi uploadhere_ + Drive ID (33 char) = ~43 byte → masih aman
       buttons.push([
         Markup.button.callback(`📤 Upload ke "${folderName.substring(0, 18)}"`, `uploadhere_${folderId}`)
       ]);
 
-      // Subfolder (maks 20)
       for (const sf of subfolders.slice(0, 20)) {
         const sfKey = fpKey(userId, sf.id);
-        // callback: "pf:sfKey:curKey" — maks ~10 byte
         buttons.push([
           Markup.button.callback(`📁 ${sf.name.substring(0, 32)}`, `pf:${sfKey}:${curKey}`)
         ]);
@@ -704,7 +645,6 @@ function registerCommands(bot, pendingActions) {
         buttons.push([Markup.button.callback(`… ${subfolders.length - 20} subfolder lagi tidak tampil`, 'noop')]);
       }
 
-      // Tombol back
       if (parKey) {
         buttons.push([Markup.button.callback('🔙 Kembali', `pf:${parKey}:back`)]);
       }
@@ -722,8 +662,6 @@ function registerCommands(bot, pendingActions) {
     }
   }
 
-  // Callback navigasi folder picker
-  // format: "pf:{folderKey}:{parentKey|back}"
   bot.action(/^pf:([a-z0-9]+):([a-z0-9]+|back)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const userId = ctx.from.id;
@@ -740,23 +678,19 @@ function registerCommands(bot, pendingActions) {
     await showFolderPicker(ctx, creds, folderId, parentId, true);
   });
 
-  // Callback noop
   bot.action('noop', async (ctx) => { await ctx.answerCbQuery(); });
 
   // ── /setfolder ─────────────────────────────────────────────────────────────
-  // Set folder default untuk semua upload berikutnya
   bot.command('setfolder', async (ctx) => {
     const creds = await getUserCredentials(ctx.from.id);
     if (!creds) return ctx.reply('❌ Belum setup. Ketik /setup');
 
     const input = ctx.message.text.replace('/setfolder', '').trim();
 
-    // Tanpa argumen → tampilkan folder picker dari root Drive
     if (!input) {
       try {
         const folders = await listFolders(creds);
 
-        // Kalau ada folder default sekarang, tampilkan dulu
         let currentMsg = '';
         if (creds.defaultFolderId) {
           try {
@@ -791,7 +725,6 @@ function registerCommands(bot, pendingActions) {
       return;
     }
 
-    // Dengan argumen link → parse dan set langsung
     const parsed = parseDriveLink(input);
     if (!parsed || parsed.type !== 'folder') {
       return ctx.reply('❌ Link tidak valid. Format:\nhttps://drive.google.com/drive/folders/FOLDER_ID');
@@ -799,7 +732,6 @@ function registerCommands(bot, pendingActions) {
     await applySetFolder(ctx, creds, parsed.id);
   });
 
-  // Callback: pilih folder dari list
   bot.action(/^sf_(.+)$/, async (ctx) => {
     const folderId = ctx.match[1];
     const creds = await getUserCredentials(ctx.from.id);
@@ -807,7 +739,6 @@ function registerCommands(bot, pendingActions) {
     await applySetFolder(ctx, creds, folderId, true);
   });
 
-  // Callback: hapus folder default
   bot.action('setfolder_clear', async (ctx) => {
     await ctx.answerCbQuery();
     const { saveUser } = require('../lib/users');
@@ -843,7 +774,6 @@ function registerCommands(bot, pendingActions) {
     }
   }
 
-  // ── Register command list (muncul saat user ketik / di chat) ───────────────
   async function registerBotCommands() {
     await bot.telegram.setMyCommands([
       { command: 'start',      description: '👋 Mulai bot' },
@@ -865,10 +795,8 @@ function registerCommands(bot, pendingActions) {
     ]);
   }
 
-  // Jalankan sekali saat bot start
   registerBotCommands().catch(console.error);
 
-  // Expose
   return { handleDownloadLink, handleUploadToLink };
 }
 
