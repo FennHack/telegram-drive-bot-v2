@@ -13,7 +13,7 @@ const pendingActions = {};
 
 // ── Register handlers ──────────────────────────────────────────────────────────
 registerSetup(bot);
-registerCommands(bot, pendingActions);
+const { handleDownloadLink } = registerCommands(bot, pendingActions);
 registerFileActions(bot, pendingActions);
 
 // ── Media upload handlers ──────────────────────────────────────────────────────
@@ -62,7 +62,13 @@ bot.on('text', async (ctx) => {
 
   const text = ctx.message.text.trim();
 
-  // Cek setup sebelum handle pending actions
+  // ── Download prompt ──────────────────────────────────────────────────────
+  if (pending.action === 'download_prompt') {
+    delete pendingActions[ctx.from.id];
+    return handleDownloadLink(ctx, text);
+  }
+
+  // Cek setup sebelum handle pending actions lainnya
   const { isSetup } = require('./lib/users');
   if (!(await isSetup(ctx.from.id))) {
     delete pendingActions[ctx.from.id];
@@ -92,10 +98,10 @@ bot.on('text', async (ctx) => {
   } else if (pending.action === 'search') {
     delete pendingActions[ctx.from.id];
     const { listFiles, formatBytes, shareLink } = require('./lib/drive');
+    const { Markup } = require('telegraf');
     try {
       const { files } = await listFiles(creds, { query: text, pageSize: 8 });
       if (files.length === 0) return ctx.reply(`🔍 Tidak ada file dengan nama "${text}".`);
-      const { Markup } = require('telegraf');
       let msg = `🔍 Hasil: "${text}" (${files.length} file)\n\n`;
       const buttons = [];
       files.forEach((f, i) => {
