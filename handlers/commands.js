@@ -32,7 +32,7 @@ function registerCommands(bot, pendingActions) {
       '/drive — Lihat file di Drive\n' +
       '/browse — Browse folder\n' +
       '/download — Download file/folder dari Drive\n' +
-      '/uploadurl — Upload dari URL\n' +
+      '/uploadto — Upload ke folder Drive tertentu\n' +
       '/cari — Cari file\n' +
       '/storage — Info penyimpanan\n' +
       '/riwayat — Riwayat upload\n' +
@@ -60,6 +60,7 @@ function registerCommands(bot, pendingActions) {
       '📤 UPLOAD FILE\n' +
       '• Kirim foto/video/dokumen langsung\n' +
       '• /uploadurl [url] — upload dari link internet\n' +
+      '• /uploadto [link folder] — upload ke folder Drive tertentu\n' +
       '• /browse — pilih folder lalu upload ke sana\n\n' +
       '📂 KELOLA FILE\n' +
       '• /drive — 10 file terbaru\n' +
@@ -421,14 +422,16 @@ function registerCommands(bot, pendingActions) {
     return false;
   }
 
-  // ── Download folder → ZIP ──────────────────────────────────────────────────
+  // ── Download folder → ZIP (batch, tanpa limit file) ───────────────────────
+  const BATCH_SIZE = 50; // file per ZIP part
+
   async function downloadFolder(ctx, creds, folderId) {
     const archiver = require('archiver');
     const fs = require('fs');
     const path = require('path');
     const os = require('os');
     const axios = require('axios');
-    const { listFolderContents, getFileInfo, downloadLink, formatBytes } = require('../lib/drive');
+    const { listFolderContents, downloadLink, formatBytes } = require('../lib/drive');
 
     const statusMsg = await ctx.reply('🔍 Menganalisis isi folder...');
     try {
@@ -449,96 +452,146 @@ function registerCommands(bot, pendingActions) {
       if (allFiles.length === 0) {
         return ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, '❌ Folder kosong.');
       }
-      if (allFiles.length > 20) {
-        return ctx.telegram.editMessageText(
-          ctx.chat.id, statusMsg.message_id, null,
-          `⚠️ Folder berisi ${allFiles.length} file.\n\nMaksimal 20 file per download ZIP.\n\nGunakan /browse untuk memilih subfolder yang lebih kecil.`
-        );
-      }
 
-      // Kirim preview foto-foto di dalam folder (maks 3)
+      // Hitung total batch
+      const totalBatches = Math.ceil(allFiles.length / BATCH_SIZE);
+      const totalSize = allFiles.reduce((s, f) => s + parseInt(f.size || 0), 0);
+
+      // Kirim preview foto (maks 3)
       const images = allFiles.filter(f => f.mimeType.startsWith('image/')).slice(0, 3);
       if (images.length > 0) {
-        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-          `🖼 Preview foto dalam folder (${images.length} dari ${allFiles.length} file)...`
-        );
+        try {
+          await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
+            `🖼 Preview foto dalam folder...`
+          );
+        } catch (_) {}
         for (const img of images) {
-          try {
-            await ctx.replyWithPhoto(downloadLink(img.id), { caption: `🖼 ${img.name}` });
-          } catch (_) {}
+          try { await ctx.replyWithPhoto(downloadLink(img.id), { caption: `🖼 ${img.name}` }); } catch (_) {}
         }
       }
 
-      // Buat manifest
-      let manifest = `📂 Isi Folder (${allFiles.length} file)\n\n`;
-      allFiles.forEach((f, i) => {
+      // Kirim manifest (potong kalau terlalu panjang)
+      const manifestLines = allFiles.map((f, i) => {
         const icon =
           f.mimeType.startsWith('image/') ? '🖼' :
           f.mimeType.startsWith('video/') ? '🎬' :
           f.mimeType.startsWith('audio/') ? '🎵' :
           f.mimeType === 'application/pdf' ? '📄' : '📁';
-        manifest += `${i + 1}. ${icon} ${f.zipPath} (${formatBytes(f.size)})\n`;
+        return `${i + 1}. ${icon} ${f.zipPath} (${formatBytes(f.size)})`;
       });
-      await ctx.reply(manifest);
 
-      // ZIP
-      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-        `📦 Mengemas ${allFiles.length} file ke ZIP...\n\n[░░░░░░░░░░░░░░░░░░░░] 0%`
-      );
+      // Telegram max 4096 char — potong manifest jika perlu
+      const header = `📂 Isi Folder — ${allFiles.length} file (${formatBytes(totalSize)})\n` +
+        (totalBatches > 1 ? `📦 Akan dikirim dalam ${totalBatches} ZIP part\n` : '') + '\n';
+      let manifestText = header;
+      for (const line of manifestLines) {
+        if ((manifestText + line + '\n').length > 4000) {
+          manifestText += `... dan ${allFiles.length - manifestLines.indexOf(line)} file lainnya`;
+          break;
+        }
+        manifestText += line + '\n';
+      }
+      await ctx.reply(manifestText);
 
-      const zipPath = path.join(os.tmpdir(), `drivezip_${Date.now()}.zip`);
-      const output = fs.createWriteStream(zipPath);
-      const archive = archiver('zip', { zlib: { level: 6 } });
-      archive.pipe(output);
+      // Proses per batch
+      for (let batch = 0; batch < totalBatches; batch++) {
+        const batchFiles = allFiles.slice(batch * BATCH_SIZE, (batch + 1) * BATCH_SIZE);
+        const partLabel = totalBatches > 1 ? ` (Part ${batch + 1}/${totalBatches})` : '';
 
-      const tmpFiles = [];
-      for (let i = 0; i < allFiles.length; i++) {
-        const f = allFiles[i];
-        const pct = Math.round(((i) / allFiles.length) * 100);
-        const filled = Math.round(pct / 5);
-        const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
         try {
           await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-            `📦 Mengemas file ${i + 1}/${allFiles.length}...\n[${bar}] ${pct}%\n\n📄 ${f.name}`
+            `📦 Memproses ZIP${partLabel}...\n\n[░░░░░░░░░░░░░░░░░░░░] 0%\n\n` +
+            `📁 ${batchFiles.length} file dalam batch ini`
           );
         } catch (_) {}
 
-        const tmpFile = path.join(os.tmpdir(), `zipitem_${Date.now()}_${i}`);
-        try {
-          const dlUrl = downloadLink(f.id);
-          const response = await axios({ url: dlUrl, method: 'GET', responseType: 'stream', timeout: 60000 });
-          await new Promise((resolve, reject) => {
-            const writer = fs.createWriteStream(tmpFile);
-            response.data.pipe(writer);
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-          });
-          archive.file(tmpFile, { name: f.zipPath });
-          tmpFiles.push(tmpFile);
-        } catch (_) {
-          // Skip file yang gagal, lanjut
+        const zipPath = path.join(os.tmpdir(), `drivezip_${Date.now()}_part${batch + 1}.zip`);
+        const output = fs.createWriteStream(zipPath);
+        const archive = archiver('zip', { zlib: { level: 6 } });
+        archive.pipe(output);
+
+        const tmpFiles = [];
+        let failed = 0;
+
+        for (let i = 0; i < batchFiles.length; i++) {
+          const f = batchFiles[i];
+          const globalIdx = batch * BATCH_SIZE + i + 1;
+          const pct = Math.round((i / batchFiles.length) * 100);
+          const filled = Math.round(pct / 5);
+          const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+
+          try {
+            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
+              `📦 Mengemas${partLabel}...\n[${bar}] ${pct}%\n\n` +
+              `📄 ${globalIdx}/${allFiles.length}: ${f.name}`
+            );
+          } catch (_) {}
+
+          const tmpFile = path.join(os.tmpdir(), `zipitem_${Date.now()}_${i}`);
+          try {
+            const response = await axios({
+              url: downloadLink(f.id),
+              method: 'GET',
+              responseType: 'stream',
+              timeout: 120000,
+            });
+            await new Promise((resolve, reject) => {
+              const writer = fs.createWriteStream(tmpFile);
+              response.data.pipe(writer);
+              writer.on('finish', resolve);
+              writer.on('error', reject);
+            });
+            archive.file(tmpFile, { name: f.zipPath });
+            tmpFiles.push(tmpFile);
+          } catch (_) {
+            failed++;
+          }
         }
+
+        await new Promise((resolve, reject) => {
+          output.on('close', resolve);
+          archive.on('error', reject);
+          archive.finalize();
+        });
+
+        const zipSize = fs.statSync(zipPath).size;
+
+        // Cek ukuran ZIP — Telegram max 50MB untuk bot
+        if (zipSize > 49 * 1024 * 1024) {
+          await ctx.reply(
+            `⚠️ ZIP Part ${batch + 1} terlalu besar (${formatBytes(zipSize)}) untuk dikirim via Telegram.\n\n` +
+            `Batas Telegram: 50MB per file.\n` +
+            `Gunakan /browse untuk download subfolder yang lebih kecil.`
+          );
+        } else {
+          try {
+            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
+              `📤 Mengirim ZIP${partLabel} (${formatBytes(zipSize)})...`
+            );
+          } catch (_) {}
+
+          const filename = totalBatches > 1
+            ? `drive_part${batch + 1}of${totalBatches}_${Date.now()}.zip`
+            : `drive_folder_${Date.now()}.zip`;
+
+          await ctx.replyWithDocument(
+            { source: zipPath, filename },
+            { caption: `📦 Part ${batch + 1}/${totalBatches} — ${batchFiles.length} file — ${formatBytes(zipSize)}${failed > 0 ? `\n⚠️ ${failed} file gagal diunduh` : ''}` }
+          );
+        }
+
+        // Cleanup batch ini
+        try { fs.unlinkSync(zipPath); } catch (_) {}
+        tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch (_) {} });
       }
 
-      await new Promise((resolve, reject) => {
-        output.on('close', resolve);
-        archive.on('error', reject);
-        archive.finalize();
-      });
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id);
+      } catch (_) {}
 
-      const zipSize = fs.statSync(zipPath).size;
-      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null,
-        `📤 Mengirim ZIP (${formatBytes(zipSize)})...`
-      );
-
-      await ctx.replyWithDocument(
-        { source: zipPath, filename: `drive_folder_${Date.now()}.zip` },
-        { caption: `📦 ${allFiles.length} file — ${formatBytes(zipSize)}` }
-      );
-
-      await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id);
-      fs.unlinkSync(zipPath);
-      tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch (_) {} });
+      if (totalBatches > 1) {
+        await ctx.reply(`✅ Selesai! Total ${totalBatches} ZIP terkirim untuk ${allFiles.length} file.`);
+      }
 
     } catch (err) {
       console.error(err);
@@ -655,8 +708,115 @@ function registerCommands(bot, pendingActions) {
     );
   });
 
-  // Expose handleDownloadLink untuk text handler di bot.js
-  return { handleDownloadLink };
+  // ── /uploadto ──────────────────────────────────────────────────────────────
+  // Usage: /uploadto https://drive.google.com/drive/folders/FOLDER_ID
+  // Atau /uploadto tanpa argumen → minta link
+  bot.command('uploadto', async (ctx) => {
+    const input = ctx.message.text.replace('/uploadto', '').trim();
+    if (!input) {
+      pendingActions[ctx.from.id] = { action: 'uploadto_prompt' };
+      return ctx.reply(
+        '📁 Upload ke Folder Drive\n\n' +
+        'Kirimkan link folder Google Drive tujuan:\n\n' +
+        'Contoh:\nhttps://drive.google.com/drive/folders/FOLDER_ID\n\n' +
+        'Bot akan menampilkan isi folder & subfolder untuk kamu pilih.',
+        Markup.inlineKeyboard([[Markup.button.callback('❌ Batal', 'cancel')]])
+      );
+    }
+    await handleUploadToLink(ctx, input);
+  });
+
+  async function handleUploadToLink(ctx, input) {
+    const creds = await getUserCredentials(ctx.from.id);
+    if (!creds) return ctx.reply('❌ Belum setup. Ketik /setup');
+
+    const parsed = parseDriveLink(input);
+    if (!parsed || parsed.type !== 'folder') {
+      return ctx.reply('❌ Link tidak dikenali atau bukan folder.\n\nFormat: https://drive.google.com/drive/folders/FOLDER_ID');
+    }
+
+    await showFolderPicker(ctx, creds, parsed.id, null, false);
+  }
+
+  /**
+   * Tampilkan picker folder untuk memilih tujuan upload.
+   * @param {object} ctx
+   * @param {object} creds
+   * @param {string} folderId   - folder yang sedang ditampilkan
+   * @param {string|null} parentId - parent folder untuk tombol Back (null = root link)
+   * @param {boolean} edit      - edit pesan existing atau kirim baru
+   */
+  async function showFolderPicker(ctx, creds, folderId, parentId, edit) {
+    try {
+      const items = await listFolderContents(creds, folderId);
+      const subfolders = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder');
+      const files = items.filter(i => i.mimeType !== 'application/vnd.google-apps.folder');
+
+      // Info folder saat ini
+      let folderName = 'Folder ini';
+      try {
+        const { getFileInfo } = require('../lib/drive');
+        const info = await getFileInfo(creds, folderId);
+        folderName = info.name;
+      } catch (_) {}
+
+      let msg = `📁 ${folderName}\n`;
+      msg += `📄 ${files.length} file`;
+      if (subfolders.length > 0) msg += ` • 📁 ${subfolders.length} subfolder`;
+      msg += '\n\nPilih subfolder atau upload langsung ke sini:';
+
+      const buttons = [];
+
+      // Tombol upload ke folder ini (selalu tampil di atas)
+      buttons.push([
+        Markup.button.callback(`📤 Upload ke "${folderName.substring(0, 20)}"`, `uploadhere_${folderId}`)
+      ]);
+
+      // Subfolder (maks 20 tombol supaya tidak overflow)
+      for (const sf of subfolders.slice(0, 20)) {
+        buttons.push([
+          Markup.button.callback(`📁 ${sf.name.substring(0, 30)}`, `pickfolder_${sf.id}_${folderId}`)
+        ]);
+      }
+
+      if (subfolders.length > 20) {
+        buttons.push([Markup.button.callback(`... dan ${subfolders.length - 20} subfolder lagi`, 'noop')]);
+      }
+
+      // Tombol back ke parent
+      if (parentId) {
+        buttons.push([Markup.button.callback('🔙 Kembali', `pickfolder_${parentId}_root`)]);
+      }
+      buttons.push([Markup.button.callback('❌ Batal', 'cancel')]);
+
+      const markup = Markup.inlineKeyboard(buttons);
+      if (edit) {
+        await ctx.editMessageText(msg, markup);
+      } else {
+        await ctx.reply(msg, markup);
+      }
+    } catch (e) {
+      const errMsg = '❌ Gagal membuka folder: ' + e.message;
+      edit ? ctx.editMessageText(errMsg) : ctx.reply(errMsg);
+    }
+  }
+
+  // Callback: navigasi folder di picker
+  // format: pickfolder_{folderId}_{parentId}
+  bot.action(/^pickfolder_([^_]+)_(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const folderId = ctx.match[1];
+    const parentId = ctx.match[2] === 'root' ? null : ctx.match[2];
+    const creds = await getUserCredentials(ctx.from.id);
+    if (!creds) return ctx.reply('❌ Belum setup.');
+    await showFolderPicker(ctx, creds, folderId, parentId, true);
+  });
+
+  // Callback noop (untuk label informatif)
+  bot.action('noop', async (ctx) => { await ctx.answerCbQuery(); });
+
+  // Expose handleDownloadLink & handleUploadToLink untuk text handler di bot.js
+  return { handleDownloadLink, handleUploadToLink };
 }
 
 module.exports = { registerCommands };
